@@ -64,22 +64,22 @@ def test_put_not_changes_read_position(queue):
     assert second_queue.get() == third_message
 
 
-def get_returns_message_from_another_process(queue):
+def test_get_returns_message_from_another_process(queue):
     message = "foo"
     data_queue = multiprocessing.Queue()
     get_process = multiprocessing.Process(
-        target=get_data_from_queue, args=(queue.name, data_queue))
+        target=put_data_to_queue, args=(queue.name, data_queue))
     get_process.start()
     data_queue.put(message)
     get_process.join()
     assert queue.get() == message
 
 
-def put_writes_message_for_another_process(queue):
+def test_put_writes_message_for_another_process(queue):
     message = "foo"
     data_queue = multiprocessing.Queue()
     get_process = multiprocessing.Process(
-        target=put_data_to_queue, args=(queue.name, data_queue))
+        target=get_data_from_queue, args=(queue.name, data_queue))
     get_process.start()
     queue.put(message)
     get_process.join()
