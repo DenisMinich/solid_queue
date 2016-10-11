@@ -72,6 +72,21 @@ class Squeue(object):
                 self._mark_message_as_read()
                 return self._read_message()
 
+    def empty(self):
+        """Checks if there is not unprocessed messages in the queue
+
+        :returns: if any messages in queue to process
+        :rtype: bool
+        """
+        self._go_to_the_read_position()
+        while True:
+            if self._is_end_of_file():
+                return True
+            if self._message_already_read():
+                self._go_to_the_next_message()
+            else:
+                return False
+
     def _read_message(self):
         """Read message from storage"""
         self._read_int(self._MESSAGE_READ_FLAG_SIZE)
