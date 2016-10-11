@@ -1,3 +1,6 @@
+# pylint: disable=invalid-name
+# pylint: disable=missing-docstring
+# pylint: disable=redefined-outer-name
 """Tests for SQueue"""
 import os
 import tempfile
@@ -18,3 +21,12 @@ def test_get_returns_message(queue):
     string_message = "foo"
     queue.put(string_message)
     assert queue.get() == string_message
+
+
+def test_get_returns_message_in_right_sequence(queue):
+    first_message = "foo"
+    second_message = "bar"
+    queue.put(first_message)
+    queue.put(second_message)
+    assert queue.get() == first_message
+    assert queue.get() == second_message
