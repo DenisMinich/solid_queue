@@ -1,25 +1,54 @@
 """SQueue implementation"""
 
+from itertools import cycle
+from itertools import islice
 import os
 
 
 class Squeue(object):
     """Named queue based on files"""
 
-    _MESSAGE_LENGTH_SIZE = 2
-    """Size in bytes of info about message length"""
+    _MESSAGE_SIZE_SIZE = 12
+    """Size in bits of info about message length"""
 
-    _MESSAGE_READ_FLAG_SIZE = 1
-    """Size in bytes of info about if message already read"""
+    _MAX_MESSAGE_SIZE = 2 ** _MESSAGE_SIZE_SIZE
+    """Max possible size of message to write in bytes"""
 
-    _MAX_MESSAGE_LENGTH = 2 ** (_MESSAGE_LENGTH_SIZE * 8)
-    """Max possible size of message to write"""
-
-    _MESSAGE_NOT_READ = 0
+    _MESSAGE_READ_FLAG_FALSE = '0'
     """Available value for flag if message hasn't been read yet"""
 
-    _MESSAGE_READ = 1
+    _MESSAGE_READ_FLAG_TRUE = '1'
     """Available value for flag if message has been read already"""
+
+    _MESSAGE_READ_FLAG_SIZE = 1
+    """Message read flag length in bits"""
+
+    _CONTROL_BITS_RULE = '1'
+    """Rule for control bits"""
+
+    _CONTROL_BITS_MINIMAL_SIZE = 2
+    """Minimal length of control bits section in bits"""
+
+    _REQUIRED_METADATA_SIZE = (
+        _MESSAGE_SIZE_SIZE +
+        _MESSAGE_READ_FLAG_SIZE +
+        _CONTROL_BITS_MINIMAL_SIZE)
+    """Minimal required length of metadata"""
+
+    _OPTIONAL_METADATA_SIZE = 8 - _REQUIRED_METADATA_SIZE % 8
+    """Length of extra bits to fullfill byte size"""
+
+    _CONTROL_BITS_SIZE = (
+        _CONTROL_BITS_MINIMAL_SIZE + _OPTIONAL_METADATA_SIZE)
+    """Length of control bits section"""
+
+    _CONTROL_BITS = ''.join(
+        islice(cycle(_CONTROL_BITS_RULE), None, _CONTROL_BITS_SIZE))
+    """Control bits"""
+
+    _METADATA_SIZE = (
+        _REQUIRED_METADATA_SIZE + _OPTIONAL_METADATA_SIZE) // 8
+    """Size in bytes of metadata"""
 
     name = None
     """Name of the queue"""
@@ -52,9 +81,11 @@ class Squeue(object):
         """
         self._go_to_the_write_position()
         message = self._serialize_message(message)
-        self._write_int(self._MESSAGE_NOT_READ, self._MESSAGE_READ_FLAG_SIZE)
-        self._write_int(len(message), self._MESSAGE_LENGTH_SIZE)
-        os.write(self._storage, message)
+        metadata = self._serialize_metadata(
+            message_length=len(message),
+            message_read=self._MESSAGE_READ_FLAG_FALSE)
+        self._write(metadata)
+        self._write(message)
 
     def get(self):
         """Returns message from the queue
@@ -89,43 +120,13 @@ class Squeue(object):
 
     def _read_message(self):
         """Read message from storage"""
-        self._read_int(self._MESSAGE_READ_FLAG_SIZE)
-        message_length = self._read_int(self._MESSAGE_LENGTH_SIZE)
-        message = self._read_bytes(message_length)
+        metadata = self._read(self._METADATA_SIZE)
+        message_length, _ = self._deserialize_metadata(metadata)
+        message = self._read(message_length)
         return self._deserialize_message(message)
 
-    def _read_int(self, length, peek=False):
-        """Read portion of data and converts it to int
-
-        :param length: length in bytes of data
-        :type length: int
-        :param peek: if True - cursor position doesn't changes
-        :type peek: bool
-        :returns: value from file
-        :rtype: int
-        """
-        data = os.read(self._storage, length)
-        if not data:
-            return None
-        if not peek:
-            self._read_position += length
-        else:
-            self._go_to_the_read_position()
-        return int.from_bytes(data, byteorder='big')
-
-    def _write_int(self, value, length):
-        """Writes int value into file
-
-        :param value: value to write
-        :type value: int
-        :param length: length in bytes of data
-        :type length: int
-        """
-        converted_data = value.to_bytes(length, byteorder='big')
-        os.write(self._storage, converted_data)
-
-    def _read_bytes(self, length, peek=False):
-        """Read portion of data and converts it to bytes
+    def _read(self, length, peek=False):
+        """Read portion of data from storage
 
         :param length: length in bytes of data
         :type length: int
@@ -135,15 +136,13 @@ class Squeue(object):
         :rtype: bytes
         """
         data = os.read(self._storage, length)
-        if data is None:
-            return None
         if not peek:
-            self._read_position += length
+            self._read_position += len(data)
         else:
             self._go_to_the_read_position()
         return data
 
-    def _write_bytes(self, value):
+    def _write(self, value):
         """Writes bytes value into file
 
         :param value: value to write
@@ -161,9 +160,9 @@ class Squeue(object):
 
     def _go_to_the_next_message(self):
         """Change cursor to the next message"""
-        self._read_int(self._MESSAGE_READ_FLAG_SIZE)
-        message_length = self._read_int(self._MESSAGE_LENGTH_SIZE)
-        if message_length:
+        metadata = self._read(self._METADATA_SIZE)
+        if metadata:
+            message_length, _ = self._deserialize_metadata(metadata)
             self._read_position += message_length
             self._go_to_the_read_position()
 
@@ -173,7 +172,7 @@ class Squeue(object):
         :returns: is end of file succeed
         :rtype: bool
         """
-        return self._read_int(self._MESSAGE_READ_FLAG_SIZE, peek=True) is None
+        return not self._read(self._METADATA_SIZE, peek=True)
 
     def _message_already_read(self):
         """Checks if next message already proceed
@@ -181,12 +180,50 @@ class Squeue(object):
         :returns: is message have been read already
         :rtype: bool
         """
-        return self._read_int(self._MESSAGE_READ_FLAG_SIZE, peek=True)
+        metadata = self._read(self._METADATA_SIZE, peek=True)
+        _, message_read = self._deserialize_metadata(metadata)
+        return message_read == self._MESSAGE_READ_FLAG_TRUE
 
     def _mark_message_as_read(self):
         """Mark current message as proceeded"""
-        self._write_int(self._MESSAGE_READ, self._MESSAGE_READ_FLAG_SIZE)
+        metadata = self._read(self._METADATA_SIZE, peek=True)
+        message_length, _ = self._deserialize_metadata(metadata)
+        new_metadata = self._serialize_metadata(
+            message_length, self._MESSAGE_READ_FLAG_TRUE)
+        self._write(new_metadata)
         self._go_to_the_read_position()
+
+    def _serialize_metadata(self, message_length, message_read):
+        """Creates metadata info based on message
+
+        :param message: message to write
+        :type message: bytes
+        :returns: metadata info
+        :rtype: bytes
+        """
+        message_length = self._int_to_binary(message_length)
+        metadata = ''.join([message_length, message_read, self._CONTROL_BITS])
+        return self._int_to_bytes(
+            self._METADATA_SIZE, self._binary_to_int(metadata))
+
+    def _deserialize_metadata(self, data):
+        """Get metadata values from bytes
+
+        :returns: metadata values
+        :rtype: iterable
+        """
+        binary = self._int_to_binary(
+            self._bytes_to_int(data), min_size=self._METADATA_SIZE * 8)
+        # pylint: disable=unbalanced-tuple-unpacking
+        message_length, message_read, control_bits = self._split_on_portions(
+            binary, portions=[
+                self._MESSAGE_SIZE_SIZE,
+                self._MESSAGE_READ_FLAG_SIZE,
+                self._CONTROL_BITS_SIZE])
+        # pylint: enable=unbalanced-tuple-unpacking
+        if control_bits != self._CONTROL_BITS:
+            return None
+        return self._binary_to_int(message_length), message_read
 
     @staticmethod
     def _serialize_message(message):
@@ -209,3 +246,70 @@ class Squeue(object):
         :rtype: any
         """
         return data.decode()
+
+    @staticmethod
+    def _split_on_portions(data, portions):
+        """Splits data on portions
+
+        :param data: data to split
+        :type data: slicable
+        :param portions: sizes of portions
+        :type portions: list of int
+        :returns: list of portions
+        :rtype list
+        """
+        result = []
+        for portion in portions:
+            result.append(data[:portion])
+            data = data[portion:]
+        return result
+
+    @staticmethod
+    def _bytes_to_int(data):
+        """Converts bytes to int value
+
+        :param data: bytes data
+        :type data: bytes
+        :returns: converted value
+        :rtype: int
+        """
+        return int.from_bytes(data, byteorder='big')
+
+    @staticmethod
+    def _int_to_bytes(length, value):
+        """Converts int value to bytes
+
+        :param value: value to convert
+        :type value: int
+        :returns: bytes data
+        :rtype: bytes
+        """
+        return value.to_bytes(length, byteorder='big')
+
+    @staticmethod
+    def _int_to_binary(value, min_size=None):
+        """Converts int value to binary string
+
+        :param value: value to convert
+        :type value: int
+        :param min_size: result string length
+        :type min_size: int or None
+        :returns: binary form
+        :rtype: str
+        """
+        value = "{0:b}".format(value)
+        string_size = len(value)
+        if min_size is not None and string_size < min_size:
+            return "0" * (min_size - string_size) + value
+        return value
+
+    @staticmethod
+    def _binary_to_int(binary):
+        """Converts binary string to int value
+
+        :param binary: binary form
+        :type binary: str
+        :returns: converted value
+        :rtype: int
+        """
+        return int(binary, base=2)

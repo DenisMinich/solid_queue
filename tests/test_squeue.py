@@ -12,7 +12,7 @@ from squeue.squeue import Squeue
 
 
 def put_data_to_queue(test_queue_name, data_queue):
-    Squeue(test_queue_name).put(data_queue.get())
+    Squeue(test_queue_name).put(data_queue.get(timeout=1))
 
 
 def get_data_from_queue(test_queue_name, data_queue):
@@ -83,7 +83,7 @@ def test_put_writes_message_for_another_process(queue):
     get_process.start()
     queue.put(message)
     get_process.join()
-    assert data_queue.get() == message
+    assert data_queue.get(timeout=1) == message
 
 
 def test_empty_returns_true_for_new_queue(queue):
