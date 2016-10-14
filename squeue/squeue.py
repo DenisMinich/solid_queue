@@ -1,63 +1,22 @@
 """SQueue implementation"""
 
-from itertools import cycle
-from itertools import islice
 import os
+
+from squeue import exceptions
+from squeue.metadata import Metadata
 
 
 class Squeue(object):
     """Named queue based on files"""
 
-    _MESSAGE_SIZE_SIZE = 12
-    """Size in bits of info about message length"""
+    _TOKEN_SIZE = 4
+    """Size in bytes of data presents version of queue"""
 
-    _MAX_MESSAGE_SIZE = 2 ** _MESSAGE_SIZE_SIZE
-    """Max possible size of message to write in bytes"""
+    _START_POSITION = _TOKEN_SIZE
+    """Position where messages start"""
 
-    _MESSAGE_READ_FLAG_FALSE = '0'
-    """Available value for flag if message hasn't been read yet"""
-
-    _MESSAGE_READ_FLAG_TRUE = '1'
-    """Available value for flag if message has been read already"""
-
-    _MESSAGE_READ_FLAG_SIZE = 1
-    """Message read flag length in bits"""
-
-    _CONTROL_BITS_RULE = '1'
-    """Rule for control bits"""
-
-    _CONTROL_BITS_MINIMAL_SIZE = 2
-    """Minimal length of control bits section in bits"""
-
-    _REQUIRED_METADATA_SIZE = (
-        _MESSAGE_SIZE_SIZE +
-        _MESSAGE_READ_FLAG_SIZE +
-        _CONTROL_BITS_MINIMAL_SIZE)
-    """Minimal required length of metadata"""
-
-    _OPTIONAL_METADATA_SIZE = 8 - _REQUIRED_METADATA_SIZE % 8
-    """Length of extra bits to fullfill byte size"""
-
-    _CONTROL_BITS_SIZE = (
-        _CONTROL_BITS_MINIMAL_SIZE + _OPTIONAL_METADATA_SIZE)
-    """Length of control bits section"""
-
-    _CONTROL_BITS = ''.join(
-        islice(cycle(_CONTROL_BITS_RULE), None, _CONTROL_BITS_SIZE))
-    """Control bits"""
-
-    _METADATA_SIZE = (
-        _REQUIRED_METADATA_SIZE + _OPTIONAL_METADATA_SIZE) // 8
-    """Size in bytes of metadata"""
-
-    name = None
-    """Name of the queue"""
-
-    _storage = None
-    """Storage for messages"""
-
-    _read_position = None
-    """Read cursor position"""
+    _read_position = 0
+    """Position of next message to read"""
 
     def _get_storage(self):
         """Returns storage for messages"""
@@ -71,7 +30,10 @@ class Squeue(object):
         """
         self.name = name
         self._storage = self._get_storage()
-        self._read_position = 0
+        if not self._check_token_is_empty():
+            self._renew_token()
+        self._token = self._get_token()
+        self._read_position = self._go_to_start_position()
 
     def put(self, message):
         """Puts message object to the queue
@@ -79,29 +41,30 @@ class Squeue(object):
         :param message: object to put
         :type message: any
         """
-        self._go_to_the_write_position()
-        message = self._serialize_message(message)
-        metadata = self._serialize_metadata(
-            message_length=len(message),
-            message_read=self._MESSAGE_READ_FLAG_FALSE)
-        self._write(metadata)
-        self._write(message)
+        self._go_to_end_position()
+        metadata = Metadata(len(message), Metadata.MESSAGE_READ_FLAG_FALSE)
+        self._write(metadata.serialize())
+        self._write(self._serialize_message(message))
 
     def get(self):
         """Returns message from the queue
 
-        :rerturns: next object in the queue
-        :rtype: any
+        :rerturns: next message from the queue or None
+        :rtype: str
         """
-        self._go_to_the_read_position()
-        while True:
-            if self._is_end_of_file():
-                return None
-            if self._message_already_read():
-                self._go_to_the_next_message()
-            else:
-                self._mark_message_as_read()
-                return self._read_message()
+        self._validate_token()
+        self._go_to_position(self._read_position)
+        while not self._is_end_of_file():
+            metadata = self._get_metadata()
+            if metadata.message_read_flag == Metadata.MESSAGE_READ_FLAG_FALSE:
+                metadata.message_read_flag = Metadata.MESSAGE_READ_FLAG_TRUE
+                self._write(metadata.serialize())
+                self._read_position += Metadata.METADATA_SIZE
+                message = self._read(metadata.message_size)
+                self._read_position = self._get_position()
+                return self._deserialize_message(message)
+            self._read_position += metadata.full_message_size
+            self._go_to_position(self._read_position)
 
     def empty(self):
         """Checks if there is not unprocessed messages in the queue
@@ -109,21 +72,72 @@ class Squeue(object):
         :returns: if any messages in queue to process
         :rtype: bool
         """
-        self._go_to_the_read_position()
-        while True:
-            if self._is_end_of_file():
-                return True
-            if self._message_already_read():
-                self._go_to_the_next_message()
-            else:
+        self._validate_token()
+        self._go_to_position(self._read_position)
+        while not self._is_end_of_file():
+            metadata = self._get_metadata()
+            if metadata.message_read_flag == Metadata.MESSAGE_READ_FLAG_FALSE:
                 return False
+            self._read_position += metadata.full_message_size
+            self._go_to_position(self._read_position)
+        return True
 
-    def _read_message(self):
-        """Read message from storage"""
-        metadata = self._read(self._METADATA_SIZE)
-        message_length, _ = self._deserialize_metadata(metadata)
-        message = self._read(message_length)
-        return self._deserialize_message(message)
+    def clean(self):
+        """Deletes unread messages from the storage"""
+        first_message_position = self._get_first_message_position()
+        if first_message_position != self._START_POSITION:
+            transfered_data_size = self._transfer_data(first_message_position)
+            self._resize_storage(transfered_data_size + self._TOKEN_SIZE)
+            self._renew_token()
+            self._read_position = self._go_to_start_position()
+
+    def _check_token_is_empty(self):
+        """Check token exists
+
+        :returns: is token exist
+        :rtype: bool
+        """
+        self._go_to_position(0)
+        return bool(self._read(self._TOKEN_SIZE, peek=True))
+
+    def _renew_token(self):
+        """Writes new token for queue"""
+        token = self._generate_token(self._TOKEN_SIZE)
+        self._go_to_position(0)
+        self._write(token)
+
+    @staticmethod
+    def _generate_token(size):
+        """Generates random bytes sequence
+
+        :param size: size of token in bytes to generate
+        :type size: int
+        :returns: new token
+        :rtype: bytes
+        """
+        return os.urandom(size)
+
+    def _get_token(self):
+        """Returns token of phisical storage
+
+        :returns: storage's token
+        :rtype: bytes
+        """
+        self._go_to_position(0)
+        token = self._read(self._TOKEN_SIZE)
+        if not token:
+            raise exceptions.NoTokenFoundError("No token found")
+        return token
+
+    def _validate_token(self):
+        """Checks if queue wasn't renewed"""
+        if self._token != self._get_token():
+            self._read_position = self._START_POSITION
+
+    def _get_metadata(self):
+        """Reads metadata for next message"""
+        metadata_info = self._read(Metadata.METADATA_SIZE, peek=True)
+        return Metadata.deserialize(metadata_info)
 
     def _read(self, length, peek=False):
         """Read portion of data from storage
@@ -136,10 +150,8 @@ class Squeue(object):
         :rtype: bytes
         """
         data = os.read(self._storage, length)
-        if not peek:
-            self._read_position += len(data)
-        else:
-            self._go_to_the_read_position()
+        if peek:
+            self._go_to_position(self._get_position() - len(data))
         return data
 
     def _write(self, value):
@@ -148,82 +160,7 @@ class Squeue(object):
         :param value: value to write
         :type value: int
         """
-        os.write(self._storage, value)
-
-    def _go_to_the_write_position(self):
-        """Changes cursor position for writing"""
-        os.lseek(self._storage, 0, os.SEEK_END)
-
-    def _go_to_the_read_position(self):
-        """Changes cursor position for reading"""
-        os.lseek(self._storage, self._read_position, os.SEEK_SET)
-
-    def _go_to_the_next_message(self):
-        """Change cursor to the next message"""
-        metadata = self._read(self._METADATA_SIZE)
-        if metadata:
-            message_length, _ = self._deserialize_metadata(metadata)
-            self._read_position += message_length
-            self._go_to_the_read_position()
-
-    def _is_end_of_file(self):
-        """Checks if there is no messages in the storage
-
-        :returns: is end of file succeed
-        :rtype: bool
-        """
-        return not self._read(self._METADATA_SIZE, peek=True)
-
-    def _message_already_read(self):
-        """Checks if next message already proceed
-
-        :returns: is message have been read already
-        :rtype: bool
-        """
-        metadata = self._read(self._METADATA_SIZE, peek=True)
-        _, message_read = self._deserialize_metadata(metadata)
-        return message_read == self._MESSAGE_READ_FLAG_TRUE
-
-    def _mark_message_as_read(self):
-        """Mark current message as proceeded"""
-        metadata = self._read(self._METADATA_SIZE, peek=True)
-        message_length, _ = self._deserialize_metadata(metadata)
-        new_metadata = self._serialize_metadata(
-            message_length, self._MESSAGE_READ_FLAG_TRUE)
-        self._write(new_metadata)
-        self._go_to_the_read_position()
-
-    def _serialize_metadata(self, message_length, message_read):
-        """Creates metadata info based on message
-
-        :param message: message to write
-        :type message: bytes
-        :returns: metadata info
-        :rtype: bytes
-        """
-        message_length = self._int_to_binary(message_length)
-        metadata = ''.join([message_length, message_read, self._CONTROL_BITS])
-        return self._int_to_bytes(
-            self._METADATA_SIZE, self._binary_to_int(metadata))
-
-    def _deserialize_metadata(self, data):
-        """Get metadata values from bytes
-
-        :returns: metadata values
-        :rtype: iterable
-        """
-        binary = self._int_to_binary(
-            self._bytes_to_int(data), min_size=self._METADATA_SIZE * 8)
-        # pylint: disable=unbalanced-tuple-unpacking
-        message_length, message_read, control_bits = self._split_on_portions(
-            binary, portions=[
-                self._MESSAGE_SIZE_SIZE,
-                self._MESSAGE_READ_FLAG_SIZE,
-                self._CONTROL_BITS_SIZE])
-        # pylint: enable=unbalanced-tuple-unpacking
-        if control_bits != self._CONTROL_BITS:
-            return None
-        return self._binary_to_int(message_length), message_read
+        return os.write(self._storage, value)
 
     @staticmethod
     def _serialize_message(message):
@@ -247,69 +184,91 @@ class Squeue(object):
         """
         return data.decode()
 
-    @staticmethod
-    def _split_on_portions(data, portions):
-        """Splits data on portions
+    def _get_position(self):
+        """Returns current position
 
-        :param data: data to split
-        :type data: slicable
-        :param portions: sizes of portions
-        :type portions: list of int
-        :returns: list of portions
-        :rtype list
-        """
-        result = []
-        for portion in portions:
-            result.append(data[:portion])
-            data = data[portion:]
-        return result
-
-    @staticmethod
-    def _bytes_to_int(data):
-        """Converts bytes to int value
-
-        :param data: bytes data
-        :type data: bytes
-        :returns: converted value
+        :returns: current cursor position
         :rtype: int
         """
-        return int.from_bytes(data, byteorder='big')
+        return os.lseek(self._storage, 0, os.SEEK_CUR)
 
-    @staticmethod
-    def _int_to_bytes(length, value):
-        """Converts int value to bytes
+    def _go_to_position(self, position):
+        """Changes cursor position
 
-        :param value: value to convert
-        :type value: int
-        :returns: bytes data
-        :rtype: bytes
+        :param position: new position for cursor
+        :type position: int
         """
-        return value.to_bytes(length, byteorder='big')
+        return os.lseek(self._storage, position, os.SEEK_SET)
 
-    @staticmethod
-    def _int_to_binary(value, min_size=None):
-        """Converts int value to binary string
+    def _go_to_start_position(self, offset=0):
+        """Moves cursot to the start
 
-        :param value: value to convert
-        :type value: int
-        :param min_size: result string length
-        :type min_size: int or None
-        :returns: binary form
-        :rtype: str
+        :param offset: offset in bytes from the start
+        :type offset: int
         """
-        value = "{0:b}".format(value)
-        string_size = len(value)
-        if min_size is not None and string_size < min_size:
-            return "0" * (min_size - string_size) + value
-        return value
+        return os.lseek(self._storage, self._TOKEN_SIZE + offset, os.SEEK_SET)
 
-    @staticmethod
-    def _binary_to_int(binary):
-        """Converts binary string to int value
+    def _go_to_end_position(self, offset=0):
+        """Moves cursot to the start
 
-        :param binary: binary form
-        :type binary: str
-        :returns: converted value
+        :param offset: offset in bytes from the start
+        :type offset: int
+        """
+        return os.lseek(self._storage, offset, os.SEEK_END)
+
+    def _is_end_of_file(self):
+        """Checks if there is no messages in the storage
+
+        :returns: is end of file reached
+        :rtype: bool
+        """
+        return not self._read(Metadata.METADATA_SIZE, peek=True)
+
+    def _get_first_message_position(self):
+        """Returns position of first unread message
+
+        :returns: position of first unread message
         :rtype: int
         """
-        return int(binary, base=2)
+        read_position = self._go_to_start_position()
+        while not self._is_end_of_file():
+            metadata = self._get_metadata()
+            if metadata.message_read_flag == Metadata.MESSAGE_READ_FLAG_FALSE:
+                break
+            read_position += metadata.full_message_size
+            self._go_to_position(read_position)
+        return read_position
+
+    def _transfer_data(self, position, buffer_size=256):
+        """Transfers valuable data from end of file to the start
+
+        :param position: position where valuable part starts
+        :type position: int
+        :param buffer_size: size of buffer for data copying
+        :type buffer_size: int
+        :returns: result amount of data transfered
+        :rtype: int
+        """
+        write_position = self._START_POSITION
+        read_position = self._go_to_position(position)
+        size_data_transfered = 0
+        while True:
+            self._go_to_position(read_position)
+            data = self._read(buffer_size)
+            if data:
+                self._go_to_position(write_position)
+                size_data = self._write(data)
+                read_position += size_data
+                write_position += size_data
+                size_data_transfered += size_data
+            else:
+                break
+        return size_data_transfered
+
+    def _resize_storage(self, size):
+        """Applies new size of storage
+
+        :param size: new size for storage
+        :type size: int
+        """
+        os.ftruncate(self._storage, size)

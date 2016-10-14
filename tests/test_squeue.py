@@ -125,3 +125,49 @@ def test_empty_not_changes_read_position(queue):
     assert queue.get() == second_message
     second_queue.empty()
     assert second_queue.get() == third_message
+
+
+def test_clean_doesnt_delete_unread_messages(queue):
+    first_message = "foo"
+    second_message = "bar"
+    queue.put(first_message)
+    queue.put(second_message)
+    queue.clean()
+    assert queue.get() == first_message
+    assert queue.get() == second_message
+
+
+def test_clean_deletes_read_messages(queue):
+    first_message = "foo"
+    second_message = "bar"
+    queue.put(first_message)
+    queue.put(second_message)
+    initial_size = os.stat(queue.name).st_size
+    queue.get()
+    assert initial_size == os.stat(queue.name).st_size
+    queue.clean()
+    new_size = os.stat(queue.name).st_size
+    assert new_size < initial_size
+    assert queue.get() == second_message
+    queue.clean()
+    new_new_size = os.stat(queue.name).st_size
+    assert new_new_size < new_size
+
+
+def test_clean_updates_read_position(queue):
+    first_message, second_message, third_message = "foo", "bar", "ham"
+    fourth_message, fifth_message, sixth_message = "tom", "yam", "jeronima"
+    messages = [
+        first_message, second_message, third_message, fourth_message,
+        fifth_message, sixth_message]
+    for message in messages:
+        queue.put(message)
+    assert queue.get() == first_message
+    assert queue.get() == second_message
+    second_queue = Squeue(queue.name)
+    assert second_queue.get() == third_message
+    queue.clean()
+    assert second_queue.get() == fourth_message
+    assert queue.get() == fifth_message
+    queue.clean()
+    assert queue.get() == sixth_message
