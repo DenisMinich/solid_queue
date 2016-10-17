@@ -19,6 +19,10 @@ def get_data_from_queue(test_queue_name, data_queue):
     data_queue.put(Squeue(test_queue_name).get())
 
 
+def get_size(file_path):
+    return os.stat(file_path).st_size
+
+
 @pytest.fixture
 def queue():
     queue_name = tempfile.NamedTemporaryFile().name
@@ -171,3 +175,16 @@ def test_clean_updates_read_position(queue):
     assert queue.get() == fifth_message
     queue.clean()
     assert queue.get() == sixth_message
+
+
+def test_queue_executes_autoclean_on_critical_size_achived(queue):
+    queue.critical_size = 5
+    queue.autoclean = False
+    message = 'foo'
+    queue.put(message)
+    queue.get()
+    assert get_size(queue.name) > queue.critical_size
+    queue.autoclean = True
+    queue.put(message)
+    queue.get()
+    assert get_size(queue.name) < queue.critical_size
