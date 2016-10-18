@@ -1,7 +1,7 @@
 # pylint: disable=invalid-name
 # pylint: disable=missing-docstring
 # pylint: disable=redefined-outer-name
-"""Tests for SQueue"""
+"""Integration tests for Squeue"""
 import multiprocessing
 import os
 import tempfile

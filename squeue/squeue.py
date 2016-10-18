@@ -1,5 +1,4 @@
 """Squeue implementation"""
-
 import os
 
 from squeue import exceptions
@@ -40,8 +39,7 @@ class Squeue(object):
         self.autoclean = autoclean
         self.critical_size = critical_size
         self._storage = self._get_storage()
-        if not self._check_token_is_empty():
-            self._renew_token()
+        self._prepare_storage()
         self._token = self._get_token()
         self._read_position = self._go_to_start_position()
 
@@ -102,6 +100,11 @@ class Squeue(object):
             self._resize_storage(transfered_data_size + self._TOKEN_SIZE)
             self._renew_token()
             self._read_position = self._go_to_start_position()
+
+    def _prepare_storage(self):
+        """Prepare storage if it was just created"""
+        if not self._check_token_is_empty():
+            self._renew_token()
 
     def _check_token_is_empty(self):
         """Check token exists
